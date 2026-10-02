@@ -1,0 +1,330 @@
+---
+title: "Apple Watch–ActLumus calibration | Exploratory data review"
+subtitle: "Light exposure, data coverage, and participant diary"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+jupyter: calibration
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This report uses the merged 1 Hz dataset to inspect light exposure, synchronization, missing measurements, and participant-reported context. All charts use the display time zone configured below. Zoom, hover, and use the range slider to explore specific validation sessions.
+
+```{python}
+#| label: setup
+#| include: false
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from IPython.display import display, Markdown
+
+# EDIT THIS to point to your merged CSV relative to the .qmd file:
+DATA_FILE = Path("data/raw/denz/calibration_1hz.csv")
+
+# Only for DISPLAY. The CSV timestamps remain UTC and are never rewritten.
+DISPLAY_TIMEZONE = "Asia/Singapore"
+
+if not DATA_FILE.exists():
+    raise FileNotFoundError(
+        f"Cannot find {DATA_FILE.resolve()}. Edit DATA_FILE in the setup cell."
+    )
+
+df = pd.read_csv(DATA_FILE, low_memory=False)
+df.columns = df.columns.str.strip()
+
+needed = {
+    "timestamp", "actlumus_lux", "watch_mean_lux", "watch_sample_count",
+    "diary_location", "has_actlumus_data", "has_watch_data",
+    "has_paired_light_data", "has_diary_data",
+}
+missing = needed - set(df.columns)
+if missing:
+    raise ValueError(f"Merged CSV missing columns: {sorted(missing)}")
+
+df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="raise")
+df = df.sort_values("timestamp").reset_index(drop=True)
+
+if df["timestamp"].duplicated().any():
+    raise ValueError("Merged CSV has duplicate timestamps")
+
+for col in ("actlumus_lux", "watch_mean_lux", "watch_sample_count"):
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+for col in (
+    "has_actlumus_data", "has_watch_data", "has_paired_light_data",
+    "has_diary_data",
+):
+    df[col] = df[col].astype("string").str.lower().eq("true").fillna(False).astype(bool)
+
+# Trust actual lux availability for pairing; validate stored flag.
+actual_pair = df["actlumus_lux"].notna() & df["watch_mean_lux"].notna()
+if not actual_pair.equals(df["has_paired_light_data"]):
+    raise ValueError("has_paired_light_data disagrees with actual lux values")
+
+# Local wall-clock time for chart labels. Do not reinterpret the raw UTC data.
+# A naive plotted time keeps the same display clock in any viewer's browser.
+df["plot_time"] = (
+    df["timestamp"]
+    .dt.tz_convert(DISPLAY_TIMEZONE)
+    .dt.tz_localize(None)
+)
+
+if len(df) > 1 and not df["timestamp"].diff().iloc[1:].eq(pd.Timedelta("1s")).all():
+    raise ValueError("Expected a continuous 1 Hz timestamp grid")
+
+TIME_LABEL = f"Local time ({DISPLAY_TIMEZONE})"
+WATCH_COLOR = "#d97706"
+ACT_COLOR = "#15803d"
+
+
+def pct(mask):
+    return 100 * mask.sum() / len(mask) if len(mask) else float("nan")
+```
+
+```{python}
+#| label: overview-summary
+start = df["timestamp"].iloc[0]
+end_exclusive = df["timestamp"].iloc[-1] + pd.Timedelta(seconds=1)
+
+summary = pd.DataFrame({
+    "Metric": [
+        "ActLumus seconds available", "Apple Watch seconds available",
+        "Seconds with both light readings", "Seconds with diary coverage",
+        "Paired light seconds with diary coverage",
+    ],
+    "Seconds": [
+        df["has_actlumus_data"].sum(), df["has_watch_data"].sum(),
+        actual_pair.sum(), df["has_diary_data"].sum(),
+        (actual_pair & df["has_diary_data"]).sum(),
+    ],
+})
+summary["Coverage of requested period"] = (
+    100 * summary["Seconds"] / len(df)
+).map(lambda p: f"{p:.1f}%")
+summary["Seconds"] = summary["Seconds"].map(lambda n: f"{n:,}")
+
+display(Markdown(
+    f"**UTC interval:** `{start.isoformat()}` to `{end_exclusive.isoformat()}` "
+    f"(end exclusive). **Total:** {len(df):,} seconds."
+))
+display(summary)
+```
+
+## Dataset structure and processing
+
+The analysis uses `calibration_1hz.csv`, which combines ActLumus, Apple Watch ambient light, Apple Watch pedometer, and the participant's diary. **Each row represents one one-second interval** on a common UTC timeline. The `timestamp` marks the **start** of that interval: for example, `2026-09-13T07:00:00.000Z` covers `07:00:00.000` up to, but not including, `07:00:01.000` UTC. The overall requested time range is also start-inclusive and end-exclusive.
+
+| Source | Column | Meaning |
+|:--|:--|:--|
+| Timeline | `timestamp` | Start of the one-second interval (UTC). |
+| ActLumus | `actlumus_lux` | ActLumus `LIGHT` measurement, in lux. |
+| ActLumus | `has_actlumus_data` | `True` if a valid ActLumus light reading exists in that interval. |
+| Watch ambient light | `watch_mean_lux` | Mean lux across distinct Watch timestamps within the interval. Repeated timestamps with conflicting lux were provisionally represented by their median before this mean was calculated. |
+| Watch ambient light | `watch_median_lux` | Median lux across those distinct timestamp observations. |
+| Watch ambient light | `watch_min_lux`, `watch_max_lux` | Lowest and highest lux among those observations. |
+| Watch ambient light | `watch_std_lux` | Sample standard deviation of the lux observations; blank when fewer than two are available. |
+| Watch ambient light | `watch_sample_count` | Number of distinct Watch timestamps contributing to the interval, **not** the number of raw CSV rows. |
+| Watch ambient light | `has_watch_data` | `True` when at least one Watch ambient-light observation contributes to the interval. |
+| Watch pedometer | `pedometer_steps` | Latest *cumulative* step count available by the interval's end; not steps taken during that second. |
+| Watch pedometer | `pedometer_distance_metres` | Corresponding cumulative distance, in metres. |
+| Watch pedometer | `pedometer_update_count` | Number of actual pedometer records whose `end_date` falls in the interval; **not** steps taken. |
+| Watch pedometer | `pedometer_age_seconds` | Age of the latest retained pedometer measurement at the interval's end. |
+| Watch pedometer | `has_pedometer_data` | `True` when a pedometer state no more than 10 seconds old is available (the current processing setting). |
+| Diary | `diary_interval_id` | Identifier of the original diary entry covering that second. |
+| Diary | `diary_location` | Self-reported environment (e.g., `indoor` or `outdoor`). |
+| Diary | `diary_on_wrist` | Self-reported Watch-wearing status; distinct from a device-measured on-wrist signal. |
+| Diary | `diary_is_moving` | Self-reported movement status. |
+| Diary | `diary_notes` | Free-text context, such as `window`, `commute`, or `tennis`. |
+| Diary | `has_diary_data` | `True` when an original diary interval covers that second. |
+| Derived | `has_paired_light_data` | `True` when *both* ActLumus lux and Watch mean lux are available in the same second. |
+
+::: {.callout-note appearance="simple"}
+**How to read missing data:** Empty lux values mean that no usable reading is available; **0 lux is still a valid observation**. Empty diary fields mean the participant did not report context for that time. Pedometer values may repeat across seconds because the last cumulative state is carried forward for up to 10 seconds; this does **not** imply zero steps during those seconds. Neither missing light readings nor diary gaps are interpolated or forward-filled.
+:::
+
+## Light exposure over time
+
+The curves show **1-minute median lux** from the available 1 Hz observations in each stream, independently. This is for visual review rather than the formal paired-sensor calibration calculation. A missing minute is left blank. Shaded regions show diary-reported indoor/outdoor intervals when an interval ID is available.
+
+```{python}
+#| label: light-timeline
+minute = (
+    df.set_index("plot_time")[["actlumus_lux", "watch_mean_lux"]]
+      .resample("1min")
+      .median()
+)
+
+fig = go.Figure()
+
+# Optional diary shading: group only by reported interval ID, not by each second.
+if "diary_interval_id" in df.columns:
+    diary_rows = df.loc[
+        df["has_diary_data"] & df["diary_interval_id"].notna(),
+        ["plot_time", "diary_interval_id", "diary_location"],
+    ]
+    for _, group in diary_rows.groupby("diary_interval_id", sort=False):
+        location = str(group["diary_location"].iloc[0]).strip().lower()
+        fill = (
+            "rgba(22, 163, 74, 0.08)" if location == "outdoor"
+            else "rgba(59, 130, 246, 0.06)" if location == "indoor"
+            else "rgba(100, 116, 139, 0.05)"
+        )
+        fig.add_vrect(
+            x0=group["plot_time"].min(),
+            x1=group["plot_time"].max() + pd.Timedelta(seconds=1),
+            fillcolor=fill, opacity=1, line_width=0, layer="below",
+        )
+
+for name, col, color in (
+    ("ActLumus", "actlumus_lux", ACT_COLOR),
+    ("Apple Watch", "watch_mean_lux", WATCH_COLOR),
+):
+    fig.add_trace(go.Scatter(
+        x=minute.index, y=minute[col], name=name,
+        mode="lines", connectgaps=False,
+        line=dict(color=color, width=1.8),
+        hovertemplate="%{x|%d %b %Y %H:%M}<br>%{y:,.1f} lux<extra>" + name + "</extra>",
+    ))
+
+fig.update_layout(
+    title="Illuminance | 1-minute median",
+    xaxis=dict(title=TIME_LABEL, rangeslider=dict(visible=True)),
+    yaxis=dict(title="Illuminance (lux)", rangemode="tozero"),
+    hovermode="x unified",
+    height=550,legend=dict(orientation="h",x=1,xanchor="right",y=1.12,),
+    margin=dict(t=90),
+    template="plotly_white",
+)
+fig.show()
+```
+
+::: {.callout-note appearance="simple"}
+**Interpretation:** A line segment means the stream has data in those plotted minutes; it does not prove uninterrupted sampling within a minute. The Apple Watch values are 1-second averages, and both streams are summarized again here for display. The diary is self-reported, not sensor-confirmed. Existing ambiguous ambient-light timestamps were provisionally consolidated using the median before generating this file.
+:::
+
+## Data coverage over time
+
+Percentage of **seconds** with actual observations in each hour. The paired-light series requires both instruments to have lux values in the same second. Partial hours are divided by the number of requested seconds present, not by a full 3,600 seconds.
+
+```{python}
+#| label: coverage-plot
+coverage = (
+    df.set_index("plot_time")[[
+        "has_actlumus_data", "has_watch_data", "has_paired_light_data"
+    ]]
+    .resample("1h")
+    .mean()
+    .mul(100)
+)
+
+fig = go.Figure()
+for name, col, color in (
+    ("ActLumus", "has_actlumus_data", ACT_COLOR),
+    ("Apple Watch", "has_watch_data", WATCH_COLOR),
+    ("Paired light", "has_paired_light_data", "#334155"),
+):
+    fig.add_trace(go.Scatter(
+        x=coverage.index, y=coverage[col], name=name,
+        mode="lines+markers", line=dict(color=color),
+        marker=dict(size=4), connectgaps=False,
+        hovertemplate="%{x|%d %b %Y %H:%M}<br>%{y:.1f}%<extra>" + name + "</extra>",
+    ))
+
+fig.update_layout(
+    title="Hourly light-data coverage",
+    xaxis_title=TIME_LABEL,
+    yaxis=dict(title="Available seconds (%)", range=[0, 102]),
+    hovermode="x unified", height=420,
+    template="plotly_white", legend=dict(orientation="h", y=1.14),
+    margin=dict(t=90),
+)
+fig.show()
+```
+
+## Watch versus ActLumus | paired measurements
+
+Each point summarizes **only seconds with both light readings** within a minute and diary location. Its color indicates reported location; *No diary* means location was not recorded. The dashed line is agreement (Watch = ActLumus), not a fitted calibration curve. Hover to see how many paired seconds contributed.
+
+```{python}
+#| label: paired-scatter
+on_wrist = (
+    df["diary_on_wrist"]
+    .astype("string")
+    .str.strip()
+    .str.lower()
+    .eq("true")
+    .fillna(False)
+)
+
+paired = df.loc[actual_pair & on_wrist, [
+    "plot_time", "watch_mean_lux", "actlumus_lux", "diary_location"
+]].copy()
+paired["minute"] = paired["plot_time"].dt.floor("min")
+paired["location"] = (
+    paired["diary_location"]
+    .fillna("No diary")
+    .astype(str)
+    .str.strip()
+    .str.lower()
+    .replace({"": "no diary", "nan": "no diary"})
+)
+paired["location"] = paired["location"].replace({"no diary": "No diary"})
+
+points = (
+    paired.groupby(["minute", "location"], as_index=False)
+    .agg(
+        actlumus_lux=("actlumus_lux", "median"),
+        watch_lux=("watch_mean_lux", "median"),
+        paired_seconds=("watch_mean_lux", "size"),
+    )
+)
+
+colors = {
+    "indoor": "#2563eb", "outdoor": "#16a34a", "No diary": "#94a3b8"
+}
+fig = go.Figure()
+for location, group in points.groupby("location", sort=True):
+    fig.add_trace(go.Scattergl(
+        x=group["actlumus_lux"], y=group["watch_lux"],
+        name=location, mode="markers",
+        marker=dict(color=colors.get(location, "#a855f7"), size=6, opacity=0.6),
+        customdata=group[["minute", "paired_seconds"]].astype({"paired_seconds": str}).to_numpy(),
+        hovertemplate=(
+            "ActLumus: %{x:,.1f} lux<br>Watch: %{y:,.1f} lux"
+            "<br>Minute: %{customdata[0]}"
+            "<br>Paired seconds: %{customdata[1]}"
+            "<extra>" + location + "</extra>"
+        ),
+    ))
+
+if not points.empty:
+    limit = float(np.nanmax(points[["actlumus_lux", "watch_lux"]].to_numpy()))
+    if limit > 0:
+        fig.add_trace(go.Scatter(
+            x=[0, limit], y=[0, limit], mode="lines",
+            name="1:1 agreement", line=dict(color="#475569", dash="dash"),
+            hoverinfo="skip",
+        ))
+
+fig.update_layout(
+    title=dict(text="Paired light readings | 1-minute medians",x=0.01,xanchor="left",),
+    xaxis=dict(title="ActLumus (lux)", rangemode="tozero"),
+    yaxis=dict(title="Apple Watch (lux)", rangemode="tozero"),
+    height=540, template="plotly_white",
+    legend=dict(orientation="h",x=0.5,xanchor="center",y=1.08,yanchor="bottom",),
+    margin=dict(t=125,b=75,),
+)
+fig.show()
+```
+
+::: {.callout-note appearance="simple"}
+**Calibration caveat:** Minute-level medians are used here for exploration and visual legibility. They do not increase the number of independent participants or sessions. Fit and assess calibration models using a pre-specified analysis unit, and inspect whether results differ by light level and participant activity.
+:::

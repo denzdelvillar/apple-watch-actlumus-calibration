@@ -1,0 +1,550 @@
+---
+title: "Calibration"
+format:
+  html:
+    code-fold: true
+    embed-resources: true
+jupyter: calibration
+editor:
+  render-on-save: true
+---
+
+## Data availability and validation-test coverage
+
+The timeline below compares the self-reported validation-test periods with
+the raw data available from ActLumus and Apple Watch data streams.
+All timestamps are shown in UTC.
+
+```{python}
+#| label: fig-data-coverage
+#| fig-cap: "Self-reported validation tests and available raw-data periods."
+#| echo: false
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
+
+# ------------------------------------------------------------
+# Load data
+# ------------------------------------------------------------
+
+df = pd.read_csv("data/manifests/submissions.csv")
+
+# Remove accidental whitespace from column names
+df.columns = df.columns.str.strip()
+
+
+# ------------------------------------------------------------
+# Parse timestamps
+# ------------------------------------------------------------
+
+def parse_utc(value):
+    """
+    Parse a timestamp as UTC.
+
+    Plotly is given timezone-naive UTC timestamps so that it displays
+    the clock time exactly in UTC rather than converting it to the
+    viewer's local timezone.
+    """
+    dt = pd.to_datetime(
+        value,
+        errors="coerce",
+        utc=True
+    )
+
+    if pd.isna(dt):
+        return pd.NaT
+
+    return dt.tz_convert("UTC").tz_localize(None)
+
+
+# ------------------------------------------------------------
+# Participant and lane layout
+# ------------------------------------------------------------
+
+# Desired visual order from TOP to BOTTOM
+display_order = [
+    "Brianna",
+    "Sebastian",
+    "Luisa",
+    "Lucien",
+    "Mariana",
+]
+
+# Plotly's numeric y-axis builds from bottom upward,
+# so reverse the list internally.
+participants = list(reversed(display_order))
+
+# IMPORTANT:
+# y increases upward, so the largest offset appears at the top.
+# Tests therefore gets the highest position within each participant.
+lane_offsets = {
+    "HealthKit daylight": 0,
+    "Pedometer": 1,
+    "Ambient light": 2,
+    "ActLumus": 3,
+    "Tests": 4,
+}
+
+lanes = [
+    "Tests",
+    "ActLumus",
+    "Ambient light",
+    "Pedometer",
+    "HealthKit daylight",
+]
+
+lanes_per_participant = 5
+participant_gap = 1.0
+
+
+def participant_base(index):
+    return index * (
+        lanes_per_participant + participant_gap
+    )
+
+
+def lane_y(participant_index, lane):
+    return (
+        participant_base(participant_index)
+        + lane_offsets[lane]
+    )
+
+
+participant_index = {
+    participant: i
+    for i, participant in enumerate(participants)
+}
+
+
+# ------------------------------------------------------------
+# Convert wide CSV into timeline intervals
+# ------------------------------------------------------------
+
+records = []
+
+for _, row in df.iterrows():
+
+    participant = str(
+        row["participant"]
+    ).strip().title()
+
+    p_idx = participant_index[participant]
+
+    # --------------------------------------------------------
+    # Self-reported validation tests
+    # A1-A4, B1-B4, C1-C4
+    # --------------------------------------------------------
+
+    for prefix in ["a", "b", "c"]:
+
+        for test_number in range(1, 5):
+
+            start_col = (
+                f"{prefix}{test_number}_start"
+            )
+
+            end_col = (
+                f"{prefix}{test_number}_end"
+            )
+
+            if (
+                start_col not in df.columns
+                or end_col not in df.columns
+            ):
+                continue
+
+            start = parse_utc(
+                row[start_col]
+            )
+
+            end = parse_utc(
+                row[end_col]
+            )
+
+            if (
+                pd.notna(start)
+                and pd.notna(end)
+                and end > start
+            ):
+
+                records.append({
+                    "participant": participant,
+                    "lane": "Tests",
+                    "y": lane_y(
+                        p_idx,
+                        "Tests"
+                    ),
+                    "start": start,
+                    "end": end,
+                    "group": "Test",
+                    "label":
+                        f"{prefix.upper()}{test_number}",
+                })
+
+
+    # --------------------------------------------------------
+    # Raw-data periods
+    # --------------------------------------------------------
+
+    raw_streams = [
+        (
+            "ActLumus",
+            "actlumus_start",
+            "actlumus_end",
+            "ActLumus",
+        ),
+        (
+            "Ambient light",
+            "watch_ambient_light_start",
+            "watch_ambient_light_end",
+            "Apple Watch",
+        ),
+        (
+            "Pedometer",
+            "pedometer_start",
+            "pedometer_end",
+            "Apple Watch",
+        ),
+        (
+            "HealthKit daylight",
+            "healthkit_daylight_start",
+            "healthkit_daylight_end",
+            "Apple Watch",
+        ),
+    ]
+
+    for (
+        lane,
+        start_col,
+        end_col,
+        group,
+    ) in raw_streams:
+
+        start = parse_utc(
+            row[start_col]
+        )
+
+        end = parse_utc(
+            row[end_col]
+        )
+
+        if (
+            pd.notna(start)
+            and pd.notna(end)
+            and end > start
+        ):
+
+            records.append({
+                "participant": participant,
+                "lane": lane,
+                "y": lane_y(
+                    p_idx,
+                    lane
+                ),
+                "start": start,
+                "end": end,
+                "group": group,
+                "label": lane,
+            })
+
+
+timeline = pd.DataFrame(records)
+
+
+# ------------------------------------------------------------
+# Calculate durations
+# ------------------------------------------------------------
+
+timeline["duration_ms"] = (
+    timeline["end"]
+    - timeline["start"]
+).dt.total_seconds() * 1000
+
+
+timeline["duration_minutes"] = (
+    timeline["end"]
+    - timeline["start"]
+).dt.total_seconds() / 60
+
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+fig = go.Figure()
+
+
+# ------------------------------------------------------------
+# Colors
+# ------------------------------------------------------------
+
+colors = {
+    "Test": "#72A9D8",
+    "ActLumus": "#66C875",
+    "Apple Watch": "#F2A541",
+}
+
+
+# ------------------------------------------------------------
+# Add bars
+# ------------------------------------------------------------
+
+for group in [
+    "Test",
+    "ActLumus",
+    "Apple Watch",
+]:
+
+    subset = timeline[
+        timeline["group"] == group
+    ].copy()
+
+    if subset.empty:
+        continue
+
+    start_text = (
+        subset["start"]
+        .dt.strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+    )
+
+    end_text = (
+        subset["end"]
+        .dt.strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+    )
+
+    customdata = np.column_stack([
+        subset["participant"],
+        subset["lane"],
+        subset["label"],
+        start_text,
+        end_text,
+        subset["duration_minutes"]
+            .round(1),
+    ])
+
+    fig.add_trace(
+        go.Bar(
+            x=subset["duration_ms"],
+            base=subset["start"],
+            y=subset["y"],
+            orientation="h",
+
+            name=group,
+
+            marker=dict(
+                color=colors[group]
+            ),
+
+            width=0.68,
+
+            # Labels appear directly on bars.
+            # Tests show A1, A2, etc.
+            # Raw streams show their stream name.
+            text=subset["label"],
+
+            textposition="inside",
+
+            insidetextanchor="middle",
+
+            customdata=customdata,
+
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "%{customdata[1]}"
+                " — %{customdata[2]}<br>"
+                "Start: %{customdata[3]}<br>"
+                "End: %{customdata[4]}<br>"
+                "Duration: %{customdata[5]} min"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+
+# ------------------------------------------------------------
+# Participant labels
+#
+# Only participant names are shown on the left.
+# Stream/lane names are intentionally omitted.
+# ------------------------------------------------------------
+
+participant_tick_positions = []
+participant_tick_labels = []
+
+for i, participant in enumerate(
+    participants
+):
+
+    # Centre participant name across its
+    # five horizontal lanes.
+    centre_y = (
+        participant_base(i)
+        + 2
+    )
+
+    participant_tick_positions.append(
+        centre_y
+    )
+
+    participant_tick_labels.append(
+        participant
+    )
+
+
+# ------------------------------------------------------------
+# Horizontal separators between participants
+# ------------------------------------------------------------
+
+for i in range(
+    1,
+    len(participants)
+):
+
+    separator_y = (
+        participant_base(i)
+        - participant_gap / 2
+    )
+
+    fig.add_hline(
+        y=separator_y,
+        line_width=1,
+        line_color="rgba(80,80,80,0.6)",
+    )
+
+
+# ------------------------------------------------------------
+# Formatting
+# ------------------------------------------------------------
+
+fig.update_layout(
+
+    title=(
+        "Validation tests and "
+        "available raw data"
+    ),
+
+    barmode="overlay",
+
+    height=max(
+        500,
+        len(participants) * 180
+    ),
+
+    xaxis=dict(
+        title="Time (UTC)",
+        type="date",
+        showgrid=True,
+
+        rangeslider=dict(
+            visible=True,
+            thickness=0.05,
+        ),
+    ),
+
+    yaxis=dict(
+        title=None,
+
+        tickmode="array",
+
+        tickvals=
+            participant_tick_positions,
+
+        ticktext=
+            participant_tick_labels,
+
+        showgrid=False,
+
+        zeroline=False,
+
+        # Padding above and below
+        range=[
+            -1,
+            participant_base(
+                len(participants) - 1
+            ) + 5,
+        ],
+    ),
+
+    legend=dict(
+        title="Data source",
+
+        orientation="h",
+
+        yanchor="bottom",
+        y=1.02,
+
+        xanchor="left",
+        x=0,
+    ),
+
+    margin=dict(
+        l=110,
+        r=30,
+        t=90,
+        b=40,
+    ),
+
+    hovermode="closest",
+
+    bargap=0.15,
+)
+
+fig.show()
+```
+
+## Current data collection status
+
+The figure above summarizes the validation periods reported by participants
+and the temporal coverage of the corresponding ActLumus and Apple Watch data.
+At this stage, data collection is still ongoing and several participant
+datasets remain incomplete or require additional recovery or clarification.
+
+::: {.callout-note appearance="simple"}
+**Note:** The displayed data-availability periods are based only on the first and last timestamps present in each raw data file. They therefore indicate the overall temporal span of the available data, but **not continuous data coverage**. Gaps may occur within these periods, for example due to ActLumus memory limitations or irregular/opaque Apple SensorKit sampling.
+:::
+
+### Participant-specific status
+
+| Participant | Current status | Main issue / follow-up |
+|---|---|---|
+| **Brianna** | Protocol completed | The available ActLumus and Apple Watch recordings do not sufficiently overlap. The ActLumus file currently available ends on 26 August, while Apple Watch data only begin around 26 August. The ActLumus device was subsequently left at the lab, so we will attempt to recover any remaining data recorded from 26 August onward. |
+| **Lucien** | Validation tests completed | The submitted Apple Watch export did not contain usable sensor data. I am currently verifying the cause with him. ActLumus data are available, but the file is too large for the current transfer method; I am waiting for Zara to provide the file from Condor Cloud. |
+| **Sebastian** | First validation session completed | The four validation tests were performed, but their exact start and end times were not recorded. I am coordinating with him to reconstruct/report the missing timing information. |
+| **Mariana** | Data collection recently started | Apple Watch data are currently incomplete because of the SensorKit holding period before data become available for export. Her ActLumus device also appears to have unusually rapid battery drain, which is interfering with continuous recording and data extraction. |
+| **Luisa** | Setup in progress | Device configuration and app installation have started, but Day 1 has not yet been reported as started in Notion. |
+
+## Preliminary operational observations
+
+At present, the collected dataset is not yet sufficient for a meaningful
+preliminary calibration analysis. Although the study protocol is relatively
+straightforward conceptually, its execution has been more difficult in
+practice because several components of the data-collection pipeline are not
+fully under participant or researcher control.
+
+The main challenges observed so far are:
+
+- **Synchronization of multiple data sources.** Successful calibration requires the self-reported validation periods, ActLumus recording, and Apple Watch recording to overlap sufficiently. Missing even one component can substantially reduce the usable validation window.
+- **SensorKit data availability.** Apple Watch SensorKit data are subject to delayed availability, and the sampling behavior of some streams is not directly controllable or fully transparent.
+- **ActLumus reliability.** Rapid battery drain and the need to retrieve or synchronize recordings can lead to gaps in otherwise correctly performed validation sessions.
+- **Manual reporting requirements.** Exact validation-test timestamps remain important for aligning the devices, but these can be missed or reported retrospectively.
+- **Distributed participation.** Participants are operating across different time zones, making synchronous troubleshooting and coordination more difficult.
+
+These observations suggest that the main limitation at this stage is not
+participant understanding of the protocol itself, but the number of
+independent technical and logistical steps that must all succeed for a
+validation session to produce a complete paired dataset.
+
+## Immediate next steps
+
+1. Recover the remaining ActLumus data for Brianna.
+2. Diagnose Lucien's empty Apple Watch export and obtain his ActLumus file.
+3. Recover the exact validation-test times from Sebastian.
+4. Continue monitoring Mariana's Apple Watch and ActLumus data coverage.
+5. Confirm Luisa's Day 1 start and subsequent data collection.
+6. Reassess usable paired validation periods once these outstanding datasets are resolved.

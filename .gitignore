@@ -1,0 +1,14 @@
+_site/
+.quarto/
+.quarto-venv/
+
+# Research data
+data/
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

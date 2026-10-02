@@ -1,0 +1,602 @@
+---
+title: "HealthKit Time in Daylight | Exploratory review"
+subtitle: "Interval-level summaries compared with ActLumus and Apple Watch illuminance"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+jupyter: calibration
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+
+This is a **standalone follow-up** to the initial Apple Watch–ActLumus calibration report. It focuses on what HealthKit reports about Time in Daylight and how its **interval-level maximum light intensity** compares with illuminance observed by the two sensors over those same intervals. It does not repeat the original report's general light-exposure plots, hourly sensor coverage, or Watch-versus-ActLumus scatter plot.
+
+HealthKit is loaded from `healthkit_daylight_processed.csv` **at its original interval resolution**. `calibration_1hz.csv` is used only to calculate sensor summaries within each HealthKit interval. No HealthKit values are distributed, interpolated, or duplicated across the master 1 Hz dataset.
+
+```{python}
+#| label: setup
+#| include: false
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from IPython.display import display, Markdown
+
+# Edit paths if your files are elsewhere relative to this .qmd file.
+HEALTHKIT_FILE = Path("data/raw/denz/healthkit_daylight_processed.csv")
+CALIBRATION_FILE = Path("data/raw/denz/calibration_1hz.csv")
+DISPLAY_TIMEZONE = "Asia/Singapore"  # For charts only; CSV timestamps stay UTC.
+
+HK_COLOR = "#16a34a"
+PARTIAL_COLOR = "#d97706"
+WATCH_COLOR = "#c66a06"
+ACT_COLOR = "#15803d"
+
+for file in (HEALTHKIT_FILE, CALIBRATION_FILE):
+    if not file.exists():
+        raise FileNotFoundError(f"Missing {file.resolve()}; edit the paths in setup.")
+
+hk = pd.read_csv(HEALTHKIT_FILE, low_memory=False)
+hk.columns = hk.columns.str.strip()
+required_hk = {
+    "start_utc", "end_utc", "daylight_minutes", "maximum_light_intensity_lux"
+}
+missing = required_hk.difference(hk.columns)
+if missing:
+    raise ValueError(f"HealthKit file is missing {sorted(missing)}")
+
+for col in ("start_utc", "end_utc"):
+    hk[col] = pd.to_datetime(hk[col], utc=True, errors="raise")
+for col in ("daylight_minutes", "maximum_light_intensity_lux"):
+    hk[col] = pd.to_numeric(hk[col], errors="coerce")
+hk = hk.sort_values(["start_utc", "end_utc"]).reset_index(drop=True)
+if hk[["start_utc", "end_utc", "daylight_minutes"]].isna().any().any():
+    raise ValueError("HealthKit file contains missing interval boundaries/daylight minutes")
+if hk[["start_utc", "end_utc"]].duplicated().any():
+    raise ValueError("Duplicate HealthKit intervals; inspect the processed input")
+if (hk["end_utc"] <= hk["start_utc"]).any():
+    raise ValueError("HealthKit intervals must have positive duration")
+if len(hk) > 1 and (
+    hk["start_utc"].iloc[1:].reset_index(drop=True)
+    < hk["end_utc"].iloc[:-1].reset_index(drop=True)
+).any():
+    raise ValueError("Overlapping HealthKit intervals; inspect the processed input")
+
+hk["duration_minutes"] = (
+    hk["end_utc"] - hk["start_utc"]
+).dt.total_seconds() / 60
+if (
+    (hk["daylight_minutes"] < 0)
+    | (hk["daylight_minutes"] > hk["duration_minutes"] + 1e-6)
+).any():
+    raise ValueError("Daylight minutes must be between 0 and the interval duration")
+
+cal = pd.read_csv(CALIBRATION_FILE, low_memory=False)
+cal.columns = cal.columns.str.strip()
+required_cal = {"timestamp", "actlumus_lux", "watch_mean_lux"}
+missing = required_cal.difference(cal.columns)
+if missing:
+    raise ValueError(f"Calibration file is missing {sorted(missing)}")
+cal["timestamp"] = pd.to_datetime(cal["timestamp"], utc=True, errors="raise")
+cal = cal.sort_values("timestamp").reset_index(drop=True)
+if cal.empty:
+    raise ValueError("Calibration CSV contains no rows")
+if cal["timestamp"].duplicated().any():
+    raise ValueError("Calibration CSV contains duplicate timestamps")
+if len(cal) > 1 and not cal["timestamp"].diff().iloc[1:].eq(pd.Timedelta("1s")).all():
+    raise ValueError("Expected a complete 1 Hz master timestamp grid")
+
+cal["actlumus_lux"] = pd.to_numeric(cal["actlumus_lux"], errors="coerce")
+cal["watch_mean_lux"] = pd.to_numeric(cal["watch_mean_lux"], errors="coerce")
+WATCH_MAX_COLUMN = (
+    "watch_max_lux" if "watch_max_lux" in cal else "watch_mean_lux"
+)
+cal[WATCH_MAX_COLUMN] = pd.to_numeric(cal[WATCH_MAX_COLUMN], errors="coerce")
+
+report_start = cal["timestamp"].iloc[0]
+report_end = cal["timestamp"].iloc[-1] + pd.Timedelta(seconds=1)
+
+# Retain original HealthKit boundaries for any interval overlapping the report.
+hk = hk.loc[
+    (hk["start_utc"] < report_end) & (hk["end_utc"] > report_start)
+].copy().reset_index(drop=True)
+hk["start_local"] = (
+    hk["start_utc"].dt.tz_convert(DISPLAY_TIMEZONE).dt.tz_localize(None)
+)
+hk["end_local"] = (
+    hk["end_utc"].dt.tz_convert(DISPLAY_TIMEZONE).dt.tz_localize(None)
+)
+hk["daylight_fraction"] = hk["daylight_minutes"] / hk["duration_minutes"]
+hk["interval_status"] = np.select(
+    [hk["daylight_minutes"].eq(0), hk["daylight_fraction"].ge(1 - 1e-6)],
+    ["Reported zero", "Full interval"],
+    default="Partial interval",
+)
+
+TIME_LABEL = f"Local time ({DISPLAY_TIMEZONE})"
+```
+
+## Data structure and interpretation
+
+The two input files intentionally have **different units of observation**:
+
+| Dataset | Key fields used here | Interpretation |
+|:--|:--|:--|
+| HealthKit intervals | `start_utc`, `end_utc` | Original UTC bounds; interval start is included, end is excluded. |
+| HealthKit intervals | `daylight_minutes` | Total daylight duration **somewhere within the interval**. |
+| HealthKit intervals | `maximum_light_intensity_lux` | Maximum light intensity reported **for the interval**, not an illuminance reading at every second. |
+| 1 Hz calibration | `timestamp` | Start of a one-second UTC bin. |
+| 1 Hz calibration | `actlumus_lux` | Available ActLumus illuminance for that second. |
+| 1 Hz calibration | `watch_max_lux` | Maximum contributing Watch sample within that second, where the column exists. |
+| 1 Hz calibration | `watch_mean_lux` | Mean Watch illuminance within that second; used as a fallback for the Watch interval maximum **only if `watch_max_lux` is absent**. |
+
+An interval containing **2 daylight minutes out of 5** does not reveal *which* two minutes—or which seconds—were classified as daylight. Missing HealthKit intervals are **unknown**, not zero daylight. Likewise, a missing lux value is not 0 lux.
+
+::: {.callout-note appearance="simple"}
+**Matching rule:** For comparisons, a 1 Hz sensor row is assigned to a HealthKit interval when the **midpoint of its one-second bin** lies within the original `[start_utc, end_utc)` interval. This is a practical boundary convention, not a claim that HealthKit samples at 1 Hz. The original HealthKit CSV remains unchanged.
+:::
+
+## HealthKit records at a glance
+
+```{python}
+#| label: healthkit-summary
+full = int((hk["interval_status"] == "Full interval").sum())
+partial = int((hk["interval_status"] == "Partial interval").sum())
+zero = int((hk["interval_status"] == "Reported zero").sum())
+summary = pd.DataFrame({
+    "Metric": [
+        "Intervals overlapping report window",
+        "Full-daylight intervals",
+        "Partial-daylight intervals",
+        "Intervals reporting zero daylight",
+        "Daylight minutes in selected complete intervals",
+        "Median HealthKit maximum (lux)",
+    ],
+    "Value": [
+        f"{len(hk):,}", f"{full:,}", f"{partial:,}", f"{zero:,}",
+        f"{hk['daylight_minutes'].sum():,.1f}",
+        (f"{hk['maximum_light_intensity_lux'].median():,.0f}"
+         if hk['maximum_light_intensity_lux'].notna().any() else "—"),
+    ],
+})
+display(Markdown(
+    f"**Requested UTC window:** `{report_start.isoformat()}` to "
+    f"`{report_end.isoformat()}` (end exclusive)."
+))
+display(summary)
+if WATCH_MAX_COLUMN != "watch_max_lux":
+    display(Markdown(
+        "**Watch maximum caveat:** This version of `calibration_1hz.csv` has no "
+        "`watch_max_lux`, so the comparison uses the maximum of available "
+        "**one-second Watch means**, which may be lower than the maximum raw sample."
+    ))
+```
+
+**Time-range caveat:** The selected records can extend slightly outside the requested window. Their original boundaries and daylight-minute totals are retained; reported minutes have **not** been prorated to the requested window. Do not interpret these selected-interval totals as a complete-day exposure total if the export has gaps.
+
+## 1. When did HealthKit report daylight?
+
+Each bar spans an **original HealthKit interval**. Its height is the number of reported daylight minutes in that whole interval; color distinguishes full, partial, and reported-zero intervals. Hover for the original bounds and HealthKit maximum intensity. White space between bars means *no HealthKit record*, not proven darkness or indoor exposure.
+
+```{python}
+#| label: healthkit-interval-timeline
+fig = go.Figure()
+if not hk.empty:
+    drawn_start = hk["start_utc"].clip(lower=report_start)
+    drawn_end = hk["end_utc"].clip(upper=report_end)
+    centers = drawn_start + (drawn_end - drawn_start) / 2
+    x = centers.dt.tz_convert(DISPLAY_TIMEZONE).dt.tz_localize(None)
+    widths_ms = (drawn_end - drawn_start).dt.total_seconds() * 1000
+    colors = hk["interval_status"].map({
+        "Full interval": HK_COLOR,
+        "Partial interval": PARTIAL_COLOR,
+        "Reported zero": "#94a3b8",
+    })
+    metadata = pd.DataFrame({
+        "start": hk["start_local"].dt.strftime("%d %b %Y %H:%M:%S"),
+        "end": hk["end_local"].dt.strftime("%d %b %Y %H:%M:%S"),
+        "duration": hk["duration_minutes"],
+        "max_lux": hk["maximum_light_intensity_lux"],
+        "status": hk["interval_status"],
+    })
+    fig.add_trace(go.Bar(
+        x=x, y=hk["daylight_minutes"], width=widths_ms,
+        marker=dict(color=colors, line=dict(color="white", width=0.8)),
+        customdata=metadata.to_numpy(),
+        hovertemplate=(
+            "Start: %{customdata[0]}<br>End: %{customdata[1]}"
+            "<br>Daylight: %{y:g} / %{customdata[2]:g} min"
+            "<br>HealthKit max: %{customdata[3]:,.0f} lux"
+            "<br>%{customdata[4]}<extra></extra>"
+        ),
+        showlegend=False,
+    ))
+fig.update_layout(
+    title=dict(text="Reported daylight minutes by original HealthKit interval", x=0.01),
+    height=465, template="plotly_white", margin=dict(t=95, b=85),
+    bargap=0, hovermode="closest",
+    xaxis=dict(title=TIME_LABEL, rangeslider=dict(visible=True, thickness=0.075)),
+    yaxis=dict(title="Reported daylight (min / interval)", rangemode="tozero"),
+)
+fig.show()
+```
+
+## 2. How do HealthKit's interval maxima compare with measured illuminance?
+
+For each HealthKit interval, we find the highest **observed** ActLumus lux and the highest available Watch lux from assigned 1 Hz rows. We also count how many assigned seconds had readings, so a low observed maximum can be interpreted alongside sampling coverage.
+
+```{python}
+#| label: interval-aggregation
+midpoints = cal["timestamp"] + pd.Timedelta(milliseconds=500)
+if len(hk):
+    start_index = pd.DatetimeIndex(hk["start_utc"])
+    end_index = pd.DatetimeIndex(hk["end_utc"])
+    matching = start_index.searchsorted(midpoints, side="right") - 1
+    in_interval = matching >= 0
+    positions = np.flatnonzero(in_interval)
+    in_interval[positions] = (
+        midpoints.iloc[positions].array
+        < end_index.take(matching[positions]).array
+    )
+else:
+    matching = np.full(len(cal), -1)
+    in_interval = np.zeros(len(cal), dtype=bool)
+
+assigned = pd.DataFrame({
+    "hk_index": matching[in_interval],
+    "actlumus": cal.loc[in_interval, "actlumus_lux"].to_numpy(),
+    "watch": cal.loc[in_interval, WATCH_MAX_COLUMN].to_numpy(),
+    "watch_present": cal.loc[in_interval, "watch_mean_lux"].notna().to_numpy(),
+})
+assigned["actlumus_present"] = assigned["actlumus"].notna()
+assigned["paired"] = assigned["actlumus_present"] & assigned["watch_present"]
+
+agg = (
+    assigned.groupby("hk_index").agg(
+        represented_seconds=("hk_index", "size"),
+        actlumus_seconds=("actlumus_present", "sum"),
+        watch_seconds=("watch_present", "sum"),
+        paired_seconds=("paired", "sum"),
+        actlumus_observed_max=("actlumus", "max"),
+        watch_observed_max=("watch", "max"),
+    ) if not assigned.empty else pd.DataFrame()
+)
+intervals = hk.copy()
+intervals.index.name = "hk_index"
+for col in (
+    "represented_seconds", "actlumus_seconds", "watch_seconds",
+    "paired_seconds", "actlumus_observed_max", "watch_observed_max",
+):
+    intervals[col] = agg[col] if col in agg else np.nan
+count_columns = (
+    "represented_seconds", "actlumus_seconds", "watch_seconds", "paired_seconds"
+)
+intervals[list(count_columns)] = intervals[list(count_columns)].fillna(0).astype(int)
+for device in ("actlumus", "watch"):
+    intervals[device + "_coverage_pct"] = np.where(
+        intervals["represented_seconds"] > 0,
+        100 * intervals[device + "_seconds"] / intervals["represented_seconds"],
+        np.nan,
+    )
+```
+
+### Reported versus observed interval maximum
+
+Each point represents **one HealthKit interval per sensor**, not 300 separate observations. The dashed 1:1 line is only a visual reference: differences are possible because the sensors have different placement, sampling, and processing. Hover over a point for daylight duration, interval boundaries, and sensor coverage.
+
+```{python}
+#| label: maxima-scatter
+
+fig = go.Figure()
+
+for name, observed, coverage, color in (
+    ("ActLumus observed maximum", "actlumus_observed_max", "actlumus_coverage_pct", "#3B82F6"),
+    ("Watch observed maximum", "watch_observed_max", "watch_coverage_pct", "#F4C430"),
+):
+    pts = intervals.loc[
+        intervals["maximum_light_intensity_lux"].notna()
+        & intervals[observed].notna()
+    ]
+
+    metadata = pd.DataFrame({
+        "start": pts["start_local"].dt.strftime("%d %b %H:%M:%S"),
+        "end": pts["end_local"].dt.strftime("%d %b %H:%M:%S"),
+        "daylight": pts["daylight_minutes"],
+        "duration": pts["duration_minutes"],
+        "coverage": pts[coverage],
+    })
+
+    fig.add_trace(go.Scatter(
+        x=pts["maximum_light_intensity_lux"],
+        y=pts[observed],
+        name=name,
+        mode="markers",
+        marker=dict(
+            color=color,
+            size=9,
+            opacity=0.75,
+        ),
+        customdata=metadata.to_numpy(),
+        hovertemplate=(
+            "HealthKit max: %{x:,.0f} lux"
+            "<br>Observed sensor max: %{y:,.0f} lux"
+            "<br>%{customdata[0]} – %{customdata[1]}"
+            "<br>Daylight: %{customdata[2]:g} / %{customdata[3]:g} min"
+            "<br>Sensor coverage: %{customdata[4]:.1f}%"
+            "<extra>" + name + "</extra>"
+        ),
+    ))
+
+values = pd.concat([
+    intervals["maximum_light_intensity_lux"],
+    intervals["actlumus_observed_max"],
+    intervals["watch_observed_max"],
+]).dropna()
+
+if len(values) and values.max() > 0:
+    limit = float(values.max())
+
+    fig.add_trace(go.Scatter(
+        x=[0, limit],
+        y=[0, limit],
+        mode="lines",
+        name="1:1 reference",
+        line=dict(
+            color="#64748b",
+            dash="dash",
+            width=2,
+        ),
+        hoverinfo="skip",
+    ))
+
+fig.update_layout(
+    title=dict(
+        text="HealthKit vs sensor maxima",
+        x=0.01,
+        xanchor="left",
+        y=0.98,
+        yanchor="top",
+        font=dict(size=21),
+    ),
+
+    xaxis=dict(
+        title="HealthKit maximum intensity (lux)",
+        rangemode="tozero",
+    ),
+
+    yaxis=dict(
+        title="Observed sensor maximum (lux)",
+        rangemode="tozero",
+    ),
+
+    legend=dict(
+        orientation="h",
+        x=0.5,
+        xanchor="center",
+        y=1.02,
+        yanchor="bottom",
+        font=dict(size=12),
+    ),
+
+    height=600,
+    template="plotly_white",
+
+    margin=dict(
+        t=75,
+        b=75,
+        l=80,
+        r=40,
+    ),
+)
+
+fig.show()
+```
+
+### Maximum intensity over time
+
+This alternative view helps locate intervals where a reported HealthKit maximum differs substantially from one or both observed sensor maxima. **No line is drawn across missing records**; each marker is an interval summary, not a continuously sampled signal.
+
+```{python}
+#| label: maxima-timeline
+fig = go.Figure()
+for label, column, color, symbol in (
+    ("HealthKit reported maximum", "maximum_light_intensity_lux", "#2563eb", "diamond"),
+    ("ActLumus observed maximum", "actlumus_observed_max", ACT_COLOR, "circle"),
+    ("Watch observed maximum", "watch_observed_max", WATCH_COLOR, "square"),
+):
+    fig.add_trace(go.Scatter(
+        x=intervals["start_local"], y=intervals[column], mode="markers",
+        name=label, marker=dict(color=color, symbol=symbol, size=8, opacity=0.8),
+        customdata=intervals[["daylight_minutes", "duration_minutes"]].to_numpy(),
+        hovertemplate=(
+            "%{x|%d %b %Y %H:%M:%S} (interval start)"
+            "<br>%{y:,.0f} lux"
+            "<br>HealthKit daylight: %{customdata[0]:g} / %{customdata[1]:g} min"
+            "<extra>" + label + "</extra>"
+        ),
+    ))
+fig.update_layout(
+    title=dict(text="Interval-level maximum illuminance over time", x=0.01),
+    xaxis=dict(title=TIME_LABEL, rangeslider=dict(visible=True, thickness=0.06)),
+    yaxis=dict(title="Maximum illuminance within interval (lux)", rangemode="tozero"),
+    legend=dict(orientation="h", x=1, xanchor="right", y=1.12, yanchor="bottom"),
+    height=495, template="plotly_white", margin=dict(t=120, b=75),
+)
+fig.show()
+```
+
+## 3. Does HealthKit maximum intensity differ between full and partial daylight intervals?
+
+This is a **descriptive** plot of two measurements from the same HealthKit record. The x-axis is the duration HealthKit reported, not a reconstructed timeline of which minutes were outdoors.
+
+```{python}
+#| label: healthkit-intensity-by-daylight-duration
+fig = go.Figure()
+for label, color in (
+    ("Full interval", HK_COLOR),
+    ("Partial interval", PARTIAL_COLOR),
+    ("Reported zero", "#94a3b8"),
+):
+    subset = hk.loc[hk["interval_status"].eq(label)]
+    fig.add_trace(go.Scatter(
+        x=subset["daylight_minutes"], y=subset["maximum_light_intensity_lux"],
+        mode="markers", name=label,
+        marker=dict(color=color, opacity=0.75, size=9),
+        customdata=pd.DataFrame({
+            "start": subset["start_local"].dt.strftime("%d %b %H:%M:%S"),
+            "end": subset["end_local"].dt.strftime("%d %b %H:%M:%S"),
+            "duration": subset["duration_minutes"],
+        }).to_numpy(),
+        hovertemplate=(
+            "Daylight: %{x:g} / %{customdata[2]:g} min"
+            "<br>HealthKit maximum: %{y:,.0f} lux"
+            "<br>%{customdata[0]} – %{customdata[1]}"
+            "<extra>" + label + "</extra>"
+        ),
+    ))
+fig.update_layout(
+    title=dict(text="Reported daylight duration and HealthKit maximum intensity", x=0.01),
+    xaxis=dict(title="Reported daylight minutes per interval", rangemode="tozero"),
+    yaxis=dict(title="HealthKit maximum intensity (lux)", rangemode="tozero"),
+    legend=dict(orientation="h", x=1, xanchor="right", y=1.13, yanchor="bottom"),
+    height=490, template="plotly_white", margin=dict(t=120, b=75),
+)
+fig.show()
+```
+
+
+## 4. Diary-reported indoor/outdoor time and HealthKit daylight overlap
+
+The diary records **self-reported location**, whereas HealthKit reports **daylight minutes for an entire interval**. The comparison below distinguishes time that falls inside a HealthKit interval reporting some daylight, time in an interval reporting zero daylight, and time for which there is no HealthKit record. **Overlap with a partial-daylight interval does not establish that the individual second was spent in daylight.** Each 1 Hz diary row is assigned using its bin midpoint, consistent with the interval-maxima analysis above.
+
+```{python}
+#| label: diary-healthkit-overlap
+# Each diary row represents one second, so counting rows gives seconds.
+if "diary_location" not in cal:
+    raise ValueError("calibration_1hz.csv needs a diary_location column")
+
+location = cal["diary_location"].astype("string").str.strip().str.lower()
+valid_diary = location.isin(["indoor", "outdoor"]).to_numpy(dtype=bool)
+
+# 'matching' and 'in_interval' were created in the interval-aggregation chunk.
+hk_status = np.full(len(cal), "No HealthKit record", dtype=object)
+if in_interval.any():
+    daylight = hk["daylight_minutes"].to_numpy()[matching[in_interval]]
+    hk_status[in_interval] = np.where(
+        daylight > 0, "Interval reports daylight", "Interval reports zero"
+    )
+
+status_order = [
+    "Interval reports daylight",
+    "Interval reports zero",
+    "No HealthKit record",
+]
+location_order = ["indoor", "outdoor"]
+counts = pd.crosstab(
+    pd.Categorical(location[valid_diary], categories=location_order),
+    pd.Categorical(hk_status[valid_diary], categories=status_order),
+).reindex(index=location_order, columns=status_order, fill_value=0)
+minutes = counts / 60  # one row = one second
+
+fig = go.Figure()
+for status, color in (
+    ("Interval reports daylight", "#3B82F6"),
+    ("Interval reports zero", "#F4C430"),
+    ("No HealthKit record", "#CBD5E1"),
+):
+    fig.add_trace(go.Bar(
+        y=["Indoor", "Outdoor"],
+        x=minutes[status].to_numpy(),
+        name=status,
+        orientation="h",
+        marker_color=color,
+        hovertemplate="%{y}<br>%{x:,.1f} min<extra>" + status + "</extra>",
+    ))
+fig.update_layout(
+    title=dict(text="Diary duration and overlap with HealthKit records", x=0.01, font=dict(size=19)),
+    barmode="stack", height=390, template="plotly_white",
+    xaxis_title="Self-reported duration (minutes)",
+    yaxis=dict(autorange="reversed"),
+    legend=dict(orientation="h", x=0.5, xanchor="center", y=-0.33, yanchor="top"),
+    margin=dict(t=90, b=115, l=85, r=30),
+)
+fig.show()
+
+comparison = pd.DataFrame({
+    "Diary location": ["Indoor", "Outdoor"],
+    "Diary total (min)": minutes.sum(axis=1).to_numpy(),
+    "Within daylight-reporting interval (min)": minutes[status_order[0]].to_numpy(),
+    "Within zero-daylight interval (min)": minutes[status_order[1]].to_numpy(),
+    "Without HealthKit record (min)": minutes[status_order[2]].to_numpy(),
+})
+# Optional: bounds on actual daylight time by diary location. A partial HealthKit
+# interval does not tell us which seconds were daylight, but does constrain totals.
+assigned_diary = pd.DataFrame({
+    "hk_index": matching[in_interval & valid_diary],
+    "location": location.to_numpy()[in_interval & valid_diary],
+})
+by_interval = assigned_diary.groupby(["hk_index", "location"]).size()
+
+bounds = {}
+for loc in location_order:
+    if loc not in by_interval.index.get_level_values("location"):
+        bounds[loc] = (0.0, 0.0)
+        continue
+    seconds = by_interval.xs(loc, level="location")
+    daylight_s = hk.loc[seconds.index, "daylight_minutes"] * 60
+    non_daylight_s = (
+        hk.loc[seconds.index, "duration_minutes"] * 60 - daylight_s
+    )
+    minimum = np.maximum(0, seconds - non_daylight_s).sum() / 60
+    maximum = np.minimum(seconds, daylight_s).sum() / 60
+    bounds[loc] = (minimum, maximum)
+
+comparison["Daylight overlap lower bound (min)"] = [
+    bounds[loc][0] for loc in location_order
+]
+comparison["Daylight overlap upper bound (min)"] = [
+    bounds[loc][1] for loc in location_order
+]
+display(comparison.round(1))
+```
+
+**Interpretation:** “Within daylight-reporting interval” means temporal overlap with a HealthKit record having `daylight_minutes > 0`; it is **not** a count of daylight seconds. For example, if a five-minute HealthKit interval reports two daylight minutes, overlapping indoor diary time may or may not contain those two minutes. The last two table columns give **lower and upper bounds within HealthKit-covered intervals** on actual daylight overlap compatible with HealthKit’s reported minutes and the diary: for a partial interval, the exact location of daylight within it remains unknown. Bounds for indoor and outdoor are not independently additive. The calculation uses 1 Hz bin midpoints, so boundaries are approximate to the nearest second. Rows with missing diary location are excluded from the indoor/outdoor totals; they are not assumed to be indoor. A missing HealthKit record is not equivalent to zero daylight.
+
+
+## 5. Interval audit table
+
+The table is designed for reviewing individual intervals after inspecting the charts. **Coverage** is the percentage of the represented 1 Hz seconds assigned to that interval, *within the requested report window*, that contain a reading. An interval extending beyond the report window does not have full-period sensor coverage assessed here.
+
+```{python}
+#| label: interval-audit-table
+report = intervals[[
+    "start_local", "end_local", "daylight_minutes", "duration_minutes",
+    "maximum_light_intensity_lux", "actlumus_observed_max", "watch_observed_max",
+    "actlumus_coverage_pct", "watch_coverage_pct", "paired_seconds",
+]].copy()
+report.columns = [
+    "Start (local)", "End (local)", "HK daylight (min)",
+    "Interval (min)", "HK max (lux)", "ActLumus max (lux)",
+    "Watch max (lux)", "ActLumus coverage (%)", "Watch coverage (%)",
+    "Paired seconds",
+]
+for col in ("Start (local)", "End (local)"):
+    report[col] = report[col].dt.strftime("%d %b %Y %H:%M:%S")
+for col in (
+    "HK daylight (min)", "Interval (min)", "HK max (lux)",
+    "ActLumus max (lux)", "Watch max (lux)",
+    "ActLumus coverage (%)", "Watch coverage (%)",
+):
+    report[col] = report[col].round(1)
+display(report.reset_index(drop=True))
+```
+
+::: {.callout-note appearance="simple"}
+**Interpretation limits:** A recorded maximum is not an average, a partial-daylight record cannot locate daylight to a specific second, and absent HealthKit records cannot establish no daylight. Low sensor coverage can underestimate an observed maximum. A difference from HealthKit's maximum does not by itself explain Apple's internal computation or demonstrate a sensor fault.
+:::

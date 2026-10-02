@@ -1,0 +1,601 @@
+---
+title: "Apple Watch–ActLumus | Preliminary sensor agreement"
+subtitle: "Magnitude of illuminance differences across light intensities · two-participant analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+    df-print: default
+jupyter: calibration
+execute:
+  warning: false
+  message: false
+---
+
+## Research question
+
+**How large are the differences in illuminance measured by Apple Watch and ActLumus, and how do those differences vary across light intensities?**
+
+This report compares two participants using their independently processed `calibration_1hz.csv` files. It focuses on **paired measurements obtained while the diary indicates that both devices were worn**. The stationary on-surface validation sessions are intentionally outside this primary analysis and should be examined separately.
+
+These are preliminary *inter-instrument agreement* analyses, not estimates of absolute sensor accuracy. ActLumus is the comparison instrument, not an assumed error-free ground truth. All illuminance values are in **lux**. HealthKit Time in Daylight is not included here; it is analyzed in the separate HealthKit report.
+
+```{python}
+#| label: setup
+#| include: false
+from pathlib import Path
+import math
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from IPython.display import display, Markdown
+
+# -------------------------------------------------------------------------
+# EDIT THE PATHS BELOW to match your two participants' directories.
+# Local time zones are for hover labels only. All calculations use UTC.
+# -------------------------------------------------------------------------
+PARTICIPANTS = {
+    "Participant 1 · Singapore": {
+        "file": Path("data/raw/denz/calibration_1hz.csv"),
+        "timezone": "Asia/Singapore",
+        "color": "#2563eb",
+    },
+    "Participant 2 · Mexico City": {
+        "file": Path("data/raw/mariana/calibration_1hz.csv"),
+        "timezone": "America/Mexico_City",
+        "color": "#d6a10a",
+    },
+}
+
+# Primary analysis: at least this many paired 1 Hz seconds per minute.
+MIN_PAIRED_SECONDS = 10
+
+# For ratios, exclude very low reference values where division is unstable.
+# All illuminance levels still contribute to absolute-difference analyses.
+MIN_REFERENCE_LUX_FOR_RATIO = 10.0
+
+# Plotting only: cap plotted dots for manageable self-contained HTML files.
+# All statistical summaries always use every eligible minute.
+MAX_PLOT_POINTS_PER_PARTICIPANT = 2500
+
+BAND_EDGES = [0, 10, 100, 1000, 10000, np.inf]
+BAND_LABELS = ["0–<10", "10–<100", "100–<1,000", "1,000–<10,000", "≥10,000"]
+
+
+def as_true(series):
+    """Parse booleans consistently whether pandas read them as bool or text."""
+    return (
+        series.astype("string")
+        .str.strip()
+        .str.lower()
+        .eq("true")
+        .fillna(False)
+        .astype(bool)
+    )
+
+
+def percentage(numerator, denominator):
+    return 100.0 * numerator / denominator if denominator else np.nan
+
+
+def nfmt(number):
+    return f"{int(number):,}"
+
+
+def luxfmt(value):
+    return "—" if not np.isfinite(value) else f"{value:,.1f}"
+
+
+def ratiofmt(value):
+    return "—" if not np.isfinite(value) else f"{value:.2f}×"
+
+
+def pctfmt(value):
+    return "—" if not np.isfinite(value) else f"{value:.1f}%"
+
+
+def empty_aware_median(series):
+    cleaned = pd.to_numeric(series, errors="coerce").dropna()
+    return float(cleaned.median()) if len(cleaned) else np.nan
+
+
+def ratio_within_factor_two(ratios):
+    vals = pd.to_numeric(ratios, errors="coerce").dropna()
+    return percentage(vals.between(0.5, 2.0, inclusive="both").sum(), len(vals))
+
+
+def assign_metrics(minutes):
+    """Derived metrics apply only to paired-minute medians."""
+    out = minutes.copy()
+    out["signed_difference_lux"] = out["watch_lux"] - out["actlumus_lux"]
+    out["absolute_difference_lux"] = out["signed_difference_lux"].abs()
+    out["watch_actlumus_ratio"] = np.where(
+        out["actlumus_lux"] >= MIN_REFERENCE_LUX_FOR_RATIO,
+        out["watch_lux"] / out["actlumus_lux"].where(out["actlumus_lux"] != 0),
+        np.nan,
+    )
+    out["illuminance_band"] = pd.cut(
+        out["actlumus_lux"], BAND_EDGES,
+        labels=BAND_LABELS, right=False, include_lowest=True,
+    )
+    return out
+
+
+def make_minutes(paired_seconds, minimum):
+    """Aggregate each instrument using exactly the same eligible seconds."""
+    if paired_seconds.empty:
+        return pd.DataFrame(columns=[
+            "minute_utc", "actlumus_lux", "watch_lux", "paired_seconds"
+        ])
+    minutes = (
+        paired_seconds.assign(minute_utc=paired_seconds["timestamp"].dt.floor("min"))
+        .groupby("minute_utc", as_index=False, sort=True)
+        .agg(
+            actlumus_lux=("actlumus_lux", "median"),
+            watch_lux=("watch_mean_lux", "median"),
+            paired_seconds=("actlumus_lux", "size"),
+        )
+    )
+    return minutes.loc[minutes["paired_seconds"] >= minimum].copy()
+
+
+raw_summaries = []
+minute_frames = []
+paired_second_sets = {}
+all_minute_counts = {}
+
+for participant, settings in PARTICIPANTS.items():
+    path = settings["file"]
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Missing data for {participant}: {path.resolve()}\n"
+            "Edit PARTICIPANTS in the setup code cell."
+        )
+
+    required = [
+        "timestamp", "actlumus_lux", "watch_mean_lux", "diary_on_wrist"
+    ]
+    df = pd.read_csv(path, usecols=required, low_memory=False)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="raise").dt.as_unit("ns")
+    for column in ["actlumus_lux", "watch_mean_lux"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    if df.empty:
+        raise ValueError(f"{participant}: the calibration CSV is empty")
+    if df["timestamp"].isna().any() or df["timestamp"].duplicated().any():
+        raise ValueError(f"{participant}: timestamps are missing or duplicated")
+    if not df["timestamp"].is_monotonic_increasing:
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    if len(df) > 1 and not df["timestamp"].diff().iloc[1:].eq(pd.Timedelta("1s")).all():
+        raise ValueError(f"{participant}: expected a complete 1 Hz timeline")
+
+    finite_and_nonnegative = (
+        np.isfinite(df["actlumus_lux"])
+        & np.isfinite(df["watch_mean_lux"])
+        & df["actlumus_lux"].ge(0)
+        & df["watch_mean_lux"].ge(0)
+    )
+    # The lux values, not just the existing availability flag, determine actual pairing.
+    paired_any = finite_and_nonnegative
+    confirmed_worn = as_true(df["diary_on_wrist"])
+    eligible = paired_any & confirmed_worn
+    paired = df.loc[eligible, ["timestamp", "actlumus_lux", "watch_mean_lux"]].copy()
+    paired_second_sets[participant] = paired
+
+    all_minutes = make_minutes(paired, 1)
+    selected_minutes = make_minutes(paired, MIN_PAIRED_SECONDS)
+    all_minute_counts[participant] = all_minutes
+
+    if not selected_minutes.empty:
+        selected_minutes = assign_metrics(selected_minutes)
+        selected_minutes["participant"] = participant
+        selected_minutes["local_minute"] = (
+            selected_minutes["minute_utc"]
+            .dt.tz_convert(settings["timezone"])
+            .dt.strftime("%d %b %Y %H:%M")
+        )
+    minute_frames.append(selected_minutes)
+
+    raw_summaries.append({
+        "Participant": participant,
+        "Requested seconds": len(df),
+        "Valid paired seconds": int(paired_any.sum()),
+        "Paired seconds with both worn": len(paired),
+        "Minutes with ≥1 eligible second": len(all_minutes),
+        f"Minutes with ≥{MIN_PAIRED_SECONDS} eligible seconds": len(selected_minutes),
+        "Eligible time / requested time (%)": percentage(len(paired), len(df)),
+        "First UTC": df["timestamp"].iloc[0],
+        "Last UTC (exclusive)": df["timestamp"].iloc[-1] + pd.Timedelta("1s"),
+    })
+
+metrics = pd.concat(minute_frames, ignore_index=True)
+if metrics.empty:
+    # Preserve the expected schema when the configured minimum eliminates all minutes.
+    # The availability section will still render and explain why plots are empty.
+    metrics = pd.DataFrame(columns=[
+        "minute_utc", "actlumus_lux", "watch_lux", "paired_seconds",
+        "signed_difference_lux", "absolute_difference_lux",
+        "watch_actlumus_ratio", "illuminance_band", "participant", "local_minute",
+    ])
+coverage_summary = pd.DataFrame(raw_summaries)
+PLOT_EMPTY = metrics.empty
+
+
+def sampled_for_display(frame, max_points, seed=42):
+    """Intensity-stratified sampling, used ONLY for dots in charts."""
+    if len(frame) <= max_points:
+        return frame.copy()
+    pieces = []
+    groups = list(frame.groupby("illuminance_band", observed=True))
+    per_group = max(1, max_points // max(1, len(groups)))
+    for group_number, (_, group) in enumerate(groups):
+        n = min(len(group), per_group)
+        pieces.append(group.sample(n=n, random_state=seed + group_number))
+    result = pd.concat(pieces, ignore_index=True)
+    # Fill spare slots from previously unsampled points without changing metrics.
+    remaining = max_points - len(result)
+    if remaining > 0:
+        # Merge on unique time keys rather than on reset indices.
+        keys = set(result["minute_utc"].tolist())
+        rest = frame.loc[~frame["minute_utc"].isin(keys)]
+        if len(rest):
+            result = pd.concat(
+                [result, rest.sample(n=min(remaining, len(rest)), random_state=seed + 100)],
+                ignore_index=True,
+            )
+    return result.sort_values("minute_utc").reset_index(drop=True)
+
+
+chart_rows = []
+for participant, group in metrics.groupby("participant", sort=False):
+    chart_rows.append(sampled_for_display(group, MAX_PLOT_POINTS_PER_PARTICIPANT))
+chart_data = pd.concat(chart_rows, ignore_index=True) if chart_rows else metrics.copy()
+
+
+def style_plot(fig, x_title, y_title, x_log=False, y_log=False, show_legend=True):
+    fig.update_layout(
+        template="plotly_white",
+        height=530,
+        margin=dict(t=35, l=80, r=35, b=110 if show_legend else 75),
+        legend=dict(
+            orientation="h", x=0.5, xanchor="center",
+            y=-0.23, yanchor="top", font=dict(size=12),
+        ),
+        showlegend=show_legend,
+        hovermode="closest",
+        font=dict(size=13),
+        xaxis=dict(title=x_title, type="log" if x_log else "linear", automargin=True),
+        yaxis=dict(title=y_title, type="log" if y_log else "linear", automargin=True),
+    )
+    return fig
+
+
+def add_participant_scatter(fig, source, x_field, y_field, hover_label):
+    for participant, settings in PARTICIPANTS.items():
+        part = source.loc[source["participant"].eq(participant)].copy()
+        if part.empty:
+            continue
+        hover = np.column_stack([
+            part["local_minute"].to_numpy(),
+            part["paired_seconds"].astype(str).to_numpy(),
+        ])
+        fig.add_trace(go.Scattergl(
+            x=part[x_field], y=part[y_field], mode="markers",
+            name=participant,
+            marker=dict(color=settings["color"], size=7, opacity=0.48),
+            customdata=hover,
+            hovertemplate=(
+                hover_label
+                + "<br>Local minute: %{customdata[0]}"
+                + "<br>Paired seconds: %{customdata[1]}"
+                + "<extra>" + participant + "</extra>"
+            ),
+        ))
+
+
+def show_empty_or_figure(fig, data, description):
+    if data.empty:
+        display(Markdown(f"*No eligible paired minutes for {description}. Consider lowering MIN_PAIRED_SECONDS, after reviewing coverage.*"))
+    else:
+        fig.show(config={"responsive": True, "displaylogo": False})
+```
+
+## 1. Analysis rules and data availability
+
+The master CSV has one row per second, but **one-minute paired medians are the primary descriptive unit**. For each participant:
+
+1. Retain seconds with finite, nonnegative lux measurements from **both** instruments.
+2. Retain only those seconds with `diary_on_wrist == True` (both instruments reportedly worn). Unknown wearing status is excluded.
+3. Within each UTC minute, independently compute the median ActLumus and median Watch lux **using exactly the same eligible seconds**. No missing readings are interpolated.
+4. In the primary analysis, retain minutes with at least **`MIN_PAIRED_SECONDS` paired seconds** (configured above; default **10**).
+5. Compute differences and ratios from those two *minute medians*. Give each eligible minute equal descriptive weight.
+
+This preserves comparability despite the Watch's **irregular sampling cadence**. A Watch `watch_mean_lux` value is already the within-second mean of available distinct SensorKit timestamps. A paired second is **not necessarily a simultaneous hardware sampling instant**; temporal matching, wrist orientation, and sensor response can still affect agreement.
+
+```{python}
+#| label: availability
+printable = coverage_summary[[
+    "Participant", "Requested seconds", "Valid paired seconds",
+    "Paired seconds with both worn", "Minutes with ≥1 eligible second",
+    f"Minutes with ≥{MIN_PAIRED_SECONDS} eligible seconds",
+    "Eligible time / requested time (%)",
+]].copy()
+for column in printable.columns[1:-1]:
+    printable[column] = printable[column].map(nfmt)
+printable["Eligible time / requested time (%)"] = (
+    printable["Eligible time / requested time (%)"].map(pctfmt)
+)
+display(printable)
+
+window_info = coverage_summary[["Participant", "First UTC", "Last UTC (exclusive)"]].copy()
+for column in ["First UTC", "Last UTC (exclusive)"]:
+    window_info[column] = window_info[column].dt.strftime("%d %b %Y %H:%M UTC")
+display(Markdown("**Data windows (start-inclusive, end-exclusive):**"))
+display(window_info)
+```
+
+::: {.callout-note appearance="simple"}
+**Interpretation:** “Valid paired seconds” counts actual light-data overlap whether or not the devices were worn. “Paired seconds with both worn” is a stricter, diary-filtered subset. These counts measure **data availability**, not the number of independent observations or experiments. Both-worn status is based on the processed diary, which may contain manually reconciled or approximate entries.
+:::
+
+## 2. Overall agreement during wrist-worn use
+
+For each eligible minute, let \(A\) be the ActLumus median lux and \(W\) the Watch median lux. We calculate:
+
+- **Signed difference:** \(W-A\) lux. Positive values mean the Watch reported higher illuminance.
+- **Absolute difference:** \(|W-A|\) lux. Measures disagreement irrespective of direction.
+- **Ratio:** \(W/A\), only when \(A\) is at least **10 lux** (configurable in the setup). Below that threshold, division by small reference values would make ratios unstable.
+- **Within a factor of two:** percentage of eligible ratios between \(0.5\) and \(2.0\), inclusive. This is a **descriptive tolerance**, not an acceptance criterion for sensor replacement.
+
+```{python}
+#| label: overall-agreement
+summary_rows = []
+for participant in PARTICIPANTS:
+    group = metrics.loc[metrics["participant"].eq(participant)]
+    summary_rows.append({
+        "Participant": participant,
+        "Paired minutes": nfmt(len(group)),
+        "Median signed difference (lux)": luxfmt(empty_aware_median(group["signed_difference_lux"])),
+        "Median absolute difference (lux)": luxfmt(empty_aware_median(group["absolute_difference_lux"])),
+        "Median Watch/ActLumus ratio": ratiofmt(empty_aware_median(group["watch_actlumus_ratio"])),
+        "Minutes with defined ratio": nfmt(group["watch_actlumus_ratio"].notna().sum()),
+        "Within factor of 2": pctfmt(ratio_within_factor_two(group["watch_actlumus_ratio"])),
+    })
+display(pd.DataFrame(summary_rows))
+```
+
+**Reading the table:** The median *signed* difference can be close to zero even if positive and negative disagreements cancel. The median *absolute* difference separately captures the typical magnitude of disagreement. Ratios summarize relative differences and exclude low-reference-lux minutes by design.
+
+### 2A. Paired illuminance: Watch vs ActLumus
+
+The dashed line is exact numerical agreement (\(W=A\)). Points above it have higher Watch lux; points below it have higher ActLumus lux. Logarithmic axes emphasize the full range of positive illuminances; **zero-lux observations are not shown in this particular chart**, but remain in the absolute-difference summaries.
+
+```{python}
+#| label: agreement-scatter
+fig = go.Figure()
+positive = chart_data.loc[
+    chart_data["actlumus_lux"].gt(0) & chart_data["watch_lux"].gt(0)
+]
+add_participant_scatter(
+    fig, positive, "actlumus_lux", "watch_lux",
+    "ActLumus: %{x:,.1f} lux<br>Watch: %{y:,.1f} lux",
+)
+if not positive.empty:
+    limits = pd.concat([positive["actlumus_lux"], positive["watch_lux"]])
+    minimum = max(float(limits.min()), 1e-6)
+    maximum = max(float(limits.max()), minimum * 1.01)
+    fig.add_trace(go.Scatter(
+        x=[minimum, maximum], y=[minimum, maximum],
+        name="1:1 agreement", mode="lines",
+        line=dict(color="#475569", width=2, dash="dash"),
+        hoverinfo="skip",
+    ))
+style_plot(fig, "ActLumus median lux (log scale)", "Watch median lux (log scale)",
+           x_log=True, y_log=True)
+show_empty_or_figure(fig, positive, "the log-scale agreement plot")
+```
+
+### 2B. Signed difference vs ActLumus illuminance
+
+A horizontal value of zero means equal measured lux. This chart shows whether the **absolute size** of the Watch–ActLumus difference changes with reference illuminance. The horizontal axis is logarithmic; ActLumus = 0 lux is omitted from this chart but included in the 0–\<10 lux table band.
+
+```{python}
+#| label: signed-difference-scatter
+fig = go.Figure()
+positive = chart_data.loc[chart_data["actlumus_lux"].gt(0)]
+add_participant_scatter(
+    fig, positive, "actlumus_lux", "signed_difference_lux",
+    "ActLumus: %{x:,.1f} lux<br>Watch − ActLumus: %{y:+,.1f} lux",
+)
+fig.add_hline(y=0, line_color="#475569", line_dash="dash", line_width=1.5)
+style_plot(fig, "ActLumus median lux (log scale)",
+           "Watch − ActLumus (lux)", x_log=True)
+show_empty_or_figure(fig, positive, "the difference plot")
+```
+
+### 2C. Relative difference vs ActLumus illuminance
+
+A ratio of 1 means the two instruments reported equal illuminance; 2 means the Watch reported twice as much, and 0.5 means half as much. The plot omits minutes with ActLumus below the ratio floor (default 10 lux). Ratios equal to zero are retained, where defined.
+
+```{python}
+#| label: ratio-scatter
+fig = go.Figure()
+ratio_points = chart_data.dropna(subset=["watch_actlumus_ratio"])
+add_participant_scatter(
+    fig, ratio_points, "actlumus_lux", "watch_actlumus_ratio",
+    "ActLumus: %{x:,.1f} lux<br>Watch / ActLumus: %{y:.2f}×",
+)
+fig.add_hline(y=1, line_color="#475569", line_dash="dash", line_width=1.5)
+style_plot(fig, "ActLumus median lux (log scale)",
+           "Watch / ActLumus (ratio)", x_log=True)
+show_empty_or_figure(fig, ratio_points, "the ratio plot")
+```
+
+::: {.callout-note appearance="simple"}
+**Plotting versus estimation:** To keep the HTML manageable, each scatter plot uses an intensity-stratified sample of at most **`MAX_PLOT_POINTS_PER_PARTICIPANT` minutes per participant** (default 2,500). **All summary tables use the full set of eligible minutes.** Scatter point density therefore should not be interpreted as the exact frequency of observations in each intensity range.
+:::
+
+## 3. Agreement across illuminance levels
+
+To avoid conflating large absolute differences with large *relative* differences, we summarize both within exploratory ActLumus illuminance bands: **0–<10**, **10–<100**, **100–<1,000**, **1,000–<10,000**, and **≥10,000 lux**. These are analysis strata, **not validated daylight or indoor/outdoor thresholds**.
+
+The ratios use the configured ActLumus reference floor; thus no ratio is reported for the 0–<10 lux band under the default settings. The table reports participant-specific counts, median signed and absolute differences, and the median and 10th–90th percentile ratio when defined.
+
+```{python}
+#| label: intensity-summary
+band_records = []
+for participant in PARTICIPANTS:
+    participant_data = metrics.loc[metrics["participant"].eq(participant)]
+    for band in BAND_LABELS:
+        group = participant_data.loc[
+            participant_data["illuminance_band"].astype("string").eq(band).fillna(False)
+        ]
+        ratios = group["watch_actlumus_ratio"].dropna()
+        band_records.append({
+            "Participant": participant,
+            "ActLumus band (lux)": band,
+            "Paired minutes": nfmt(len(group)),
+            "Median signed difference (lux)": luxfmt(empty_aware_median(group["signed_difference_lux"])),
+            "Median absolute difference (lux)": luxfmt(empty_aware_median(group["absolute_difference_lux"])),
+            "Median ratio": ratiofmt(empty_aware_median(ratios)),
+            "Ratio 10th–90th percentile": (
+                f"{ratios.quantile(.1):.2f}–{ratios.quantile(.9):.2f}×"
+                if len(ratios) else "—"
+            ),
+            "Within factor of 2": pctfmt(ratio_within_factor_two(ratios)),
+        })
+intensity_table = pd.DataFrame(band_records)
+display(intensity_table)
+```
+
+### Median absolute difference by intensity band
+
+This visualization uses **the unsampled band summaries**. The bar height is the median absolute lux difference within each intensity band; use the adjacent table to see how many minutes contribute to each bar. Bars with no observations are omitted.
+
+```{python}
+#| label: intensity-bar
+fig = go.Figure()
+for participant, settings in PARTICIPANTS.items():
+    data = metrics.loc[metrics["participant"].eq(participant)]
+    magnitudes = []
+    for band in BAND_LABELS:
+        sample = data.loc[
+            data["illuminance_band"].astype("string").eq(band).fillna(False),
+            "absolute_difference_lux",
+        ]
+        magnitudes.append(float(sample.median()) if len(sample) else np.nan)
+    fig.add_trace(go.Bar(
+        name=participant, x=BAND_LABELS, y=magnitudes,
+        marker_color=settings["color"], opacity=0.85,
+        hovertemplate=(
+            "ActLumus range: %{x} lux"
+            "<br>Median absolute difference: %{y:,.1f} lux"
+            "<extra>" + participant + "</extra>"
+        ),
+    ))
+fig.update_layout(barmode="group")
+style_plot(fig, "ActLumus illuminance band (lux)", "Median absolute difference (lux)")
+fig.update_xaxes(
+    type="category",
+    categoryorder="array",
+    categoryarray=BAND_LABELS,
+)
+if PLOT_EMPTY:
+    display(Markdown("*No eligible paired minutes at the current coverage threshold.*"))
+else:
+    fig.show(config={"responsive": True, "displaylogo": False})
+```
+
+### Median Watch/ActLumus ratio by intensity band
+
+This chart compares **relative** differences over the same bands. The reference line at 1 indicates equal lux. Unlike the absolute-difference chart, this display omits bands without valid ratio estimates.
+
+```{python}
+#| label: ratio-band-bar
+fig = go.Figure()
+for participant, settings in PARTICIPANTS.items():
+    data = metrics.loc[metrics["participant"].eq(participant)]
+    median_ratios = []
+    for band in BAND_LABELS:
+        sample = data.loc[
+            data["illuminance_band"].astype("string").eq(band).fillna(False),
+            "watch_actlumus_ratio",
+        ].dropna()
+        median_ratios.append(float(sample.median()) if len(sample) else np.nan)
+    fig.add_trace(go.Bar(
+        name=participant, x=BAND_LABELS, y=median_ratios,
+        marker_color=settings["color"], opacity=0.85,
+        hovertemplate=(
+            "ActLumus range: %{x} lux"
+            "<br>Median Watch/ActLumus ratio: %{y:.2f}×"
+            "<extra>" + participant + "</extra>"
+        ),
+    ))
+fig.add_hline(y=1, line_color="#475569", line_width=1.5, line_dash="dash")
+fig.update_layout(barmode="group")
+style_plot(fig, "ActLumus illuminance band (lux)", "Median Watch / ActLumus ratio")
+fig.update_xaxes(
+    type="category",
+    categoryorder="array",
+    categoryarray=BAND_LABELS,
+)
+if metrics["watch_actlumus_ratio"].notna().any():
+    fig.show(config={"responsive": True, "displaylogo": False})
+else:
+    display(Markdown("*No defined ratios at the current settings.*"))
+```
+
+## 4. Sensitivity to paired-minute coverage
+
+The primary rule of ≥10 paired seconds per minute is a practical starting point, **not an experimentally validated cutoff**. The following table recalculates the same participant-level metrics using minimum paired-second thresholds of **1, 5, 10, 20, and 30**. This can show whether the descriptive conclusions depend heavily on excluding sparse minutes.
+
+```{python}
+#| label: coverage-sensitivity
+sensitivity = []
+for participant in PARTICIPANTS:
+    raw_pairs = paired_second_sets[participant]
+    for minimum in (1, 5, 10, 20, 30):
+        minute_set = make_minutes(raw_pairs, minimum)
+        if len(minute_set):
+            minute_set = assign_metrics(minute_set)
+            median_abs = empty_aware_median(minute_set["absolute_difference_lux"])
+            median_ratio = empty_aware_median(minute_set["watch_actlumus_ratio"])
+        else:
+            median_abs = median_ratio = np.nan
+        sensitivity.append({
+            "Participant": participant,
+            "Min paired seconds/min": minimum,
+            "Retained minutes": nfmt(len(minute_set)),
+            "Median absolute difference (lux)": luxfmt(median_abs),
+            "Median ratio": ratiofmt(median_ratio),
+        })
+display(pd.DataFrame(sensitivity))
+```
+
+If results shift substantially when the threshold changes, inspect whether the missingness is related to light intensity, activity, or device behavior. Sparse minutes can be informative about feasibility even when excluded from the primary agreement estimates.
+
+## 5. Interpretation and next analysis
+
+This exploratory report is designed to answer four descriptive questions for **each participant**:
+
+1. How much of the recording contains valid paired observations during self-reported wrist-worn use?
+2. What is the typical signed and absolute lux difference between the instruments?
+3. Is the typical Watch/ActLumus ratio approximately stable across the illuminance range, or does it vary by intensity band?
+4. Do the findings remain similar when the minimum paired-minute coverage requirement changes?
+
+::: {.callout-important appearance="simple"}
+**Limitations and scope**
+
+- **Time alignment is not simultaneous hardware sampling.** Apple Watch SensorKit samples irregularly; matching both streams to the same second reduces timing mismatch but does not eliminate it.
+- **Diary quality varies.** Both-worn classification is self-reported and may include approximate or manually reconciled intervals. A future quality-coded diary would allow a stricter sensitivity analysis.
+- **The instruments may experience different light fields.** Wrist angle, occlusion, device positioning, spectral sensitivity, and changing illumination can affect readings independently of sensor calibration.
+- **Consecutive minutes are not independent replicates.** With only two participants, the results are descriptive; we do not report population-level confidence intervals or claim that pooled minute counts represent independent participants.
+- **The x-axis is the reference instrument.** Plotting a difference or ratio against ActLumus may introduce mathematical coupling; any apparent intensity-dependent trend should later be checked with controlled validation sessions and additional diagnostics.
+- **No correction factor is fitted here.** Establishing repeatable agreement under controlled stationary and worn conditions comes first.
+:::
+
+**Suggested follow-up:** Analyze the four controlled validation conditions separately (outdoor stationary, indoor stationary, indoor moving, outdoor moving). Compare their session-level agreement with these naturalistic wrist-worn results before deciding whether a single calibration factor, an intensity-dependent model, or condition-specific treatment is appropriate.
